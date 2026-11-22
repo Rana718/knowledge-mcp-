@@ -78,6 +78,26 @@ tasks:
       - go test ./src/library -run TestMemoryReport -v
       - go test ./src/library ./src -run XXX -bench . -benchtime 30x
 
+  docker:build:
+    desc: Build the Docker image (binary + all books) as mcp-books:latest
+    cmds:
+      - docker build -t mcp-books:latest .
+
+  docker:run:
+    desc: Run the image with HTTP on 127.0.0.1:8090 (http://127.0.0.1:8090/mcp)
+    cmds:
+      - docker run --rm --name mcp-books -p 127.0.0.1:8090:8090 mcp-books:latest
+
+  docker:up:
+    desc: Build and start in the background with docker compose
+    cmds:
+      - docker compose up -d --build
+
+  docker:down:
+    desc: Stop the compose service
+    cmds:
+      - docker compose down
+
   fmt:
     desc: Format and vet the Go code
     cmds:

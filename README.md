@@ -19,6 +19,23 @@ With Task: `task serve`, `task check`, `task test`, `task call TOOL=get_book_toc
 
 If `-books` isn't given, the server tries `$MCP_BOOKS_DIR`, then `books_md` next to the binary or one level up, then `./books_md`. Indexing runs in the background at startup (about 1 second, roughly 100k passages), so the MCP handshake gets an answer right away.
 
+## Docker
+
+The image contains the server binary and the whole `books_md/` library (about 140 MB, distroless, runs as a non-root user).
+
+```sh
+docker build -t mcp-books .                                   # or: task docker:build
+docker run -d --name mcp-books -p 127.0.0.1:8090:8090 mcp-books   # HTTP at http://127.0.0.1:8090/mcp
+docker compose up -d --build                                  # same, with restart policy (task docker:up)
+```
+
+- **stdio:** `docker run -i --rm mcp-books -http ""` runs the server over stdio, so an agent can launch the container itself:
+  ```json
+  { "books": { "command": "docker", "args": ["run", "-i", "--rm", "mcp-books", "-http", ""] } }
+  ```
+- **Updating books:** the books are copied in at build time, so rebuild the image after changing `books_md/`. To use a folder from the host without rebuilding, mount it over the built-in copy: `-v /path/to/books_md:/data/books_md:ro`.
+- **Memory:** `GOMEMLIMIT=400MiB` is set in the image. After startup the container uses about 250 MB (Go heap ~165 MB plus cached book files).
+
 ## Connect an agent
 
 - **Claude Code**, in this folder: `.mcp.json` is already set up. Start `claude` here and approve the `books` server.

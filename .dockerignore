@@ -1,0 +1,8 @@
+.git
+.task
+bin
+*.md.bak
+books_md/INDEX.json.bak
+Dockerfile
+compose.yaml
+.mcp.json
