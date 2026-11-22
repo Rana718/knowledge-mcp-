@@ -1,0 +1,84 @@
+# https://taskfile.dev  —  run `task` to see all tasks
+version: "3"
+
+vars:
+  BIN: "{{.ROOT_DIR}}/bin/mcp-books"
+  BOOKS: "{{.ROOT_DIR}}/books_md"
+  ADDR: '{{.ADDR | default "127.0.0.1:8090"}}'
+
+tasks:
+  default:
+    desc: List available tasks
+    cmds:
+      - task --list
+    silent: true
+
+  build:
+    desc: Build the server binary into bin/mcp-books
+    sources: ["src/**/*.go", "go.mod", "go.sum"]
+    generates: ["bin/mcp-books"]
+    cmds:
+      - go build -o {{.BIN}} ./src
+
+  test:
+    desc: Run the end-to-end test (calls every tool over a real MCP session)
+    cmds:
+      - go test ./src -v
+
+  check:
+    desc: Load and index the library, print stats and books without usable text
+    deps: [build]
+    cmds:
+      - "{{.BIN}} -books {{.BOOKS}} -check"
+
+  serve:
+    desc: Run the MCP server over HTTP (http://ADDR/mcp). Override with `task serve ADDR=0.0.0.0:9000`
+    deps: [build]
+    cmds:
+      - task: build
+      - "{{.BIN}} -books {{.BOOKS}} -http {{.ADDR}}"
+
+  serve:debug:
+    desc: Like serve, but logs every HTTP request
+    deps: [build]
+    cmds:
+      - "{{.BIN}} -books {{.BOOKS}} -http {{.ADDR}} -v"
+
+  call:
+    desc: "Call one tool from the terminal: task call TOOL=find_books ARGS='{\"topic\":\"raft\"}'"
+    deps: [build]
+    vars:
+      TOOL: '{{.TOOL | default "list_categories"}}'
+      ARGS: '{{.ARGS | default "{}"}}'
+    cmds:
+      - "{{.BIN}} -books {{.BOOKS}} -call {{.TOOL}} -args {{shellQuote .ARGS}}"
+    silent: true
+
+  serve:stdio:
+    desc: Run the MCP server over stdio (what agent clients do; normally you don't run this by hand)
+    deps: [build]
+    cmds:
+      - "{{.BIN}} -books {{.BOOKS}}"
+
+  inspect:
+    desc: Open the MCP Inspector web UI against the server to try the tools by hand (needs Node.js)
+    deps: [build]
+    cmds:
+      - npx -y @modelcontextprotocol/inspector {{.BIN}} -books {{.BOOKS}}
+
+  install:claude:
+    desc: Register the server globally in Claude Code (user scope)
+    deps: [build]
+    cmds:
+      - claude mcp add books -s user -- {{.BIN}} -books {{.BOOKS}}
+
+  fmt:
+    desc: Format and vet the Go code
+    cmds:
+      - gofmt -w src
+      - go vet ./...
+
+  clean:
+    desc: Remove the built binary
+    cmds:
+      - rm -rf bin

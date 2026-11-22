@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "books": {
+      "command": "/run/media/rana/DEV/code/Experment/mcp_books/bin/mcp-books",
+      "args": ["-books", "/run/media/rana/DEV/code/Experment/mcp_books/books_md"]
+    }
+  }
+}
