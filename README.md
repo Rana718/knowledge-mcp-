@@ -1,6 +1,6 @@
 # mcp-books
 
-An MCP server written in Go that gives AI agents access to the `books_md/` library: 163 technical books converted to markdown. Agents can find the right book for a topic, browse a book's chapter index, read chapters and sections, and run ranked or exact search across every book.
+An MCP server written in Go that gives AI agents access to the `books_md/` library: 132 technical books converted to markdown. Agents can find the right book for a topic, browse a book's chapter index, read chapters and sections, and run ranked or exact search across every book.
 
 ## Build and run
 
@@ -51,10 +51,11 @@ docker compose up -d --build                                  # same, with resta
 
 | Tool | What it answers |
 |---|---|
+| `read_passages(query, book?, category?)` | Answers a specific question in one call. Returns the full text of the best passages from across the library, as many as fit, each with book, chapter and section id. At most 3 passages come from one book unless `book` is given. |
 | `find_books(topic \| topics[], category?, limit?)` | Which books and sections cover a topic. With a list of topics (the parts of a project) it also ranks books by how many topics they cover. Each hit shows the matched words and a section id. |
 | `find_chapters(query, book?, category?, limit?)` | Searches chapter and section titles across all books ("which books have a chapter on file locking?"). Chapters rank first. |
 | `get_book_toc(book, depth?, filter?, offset?)` | A book's chapter and section index with `sN` ids and sizes, plus its category, pages and status. `filter` searches section titles. |
-| `read_section(book, section, offset?, max_chars?)` | Reads a chapter or section by id (`s42`) or title. Long sections come in pages and start with a list of their sub-sections. |
+| `read_section(book, section, offset?, max_chars?)` | Reads a chapter or section by id (`s42`) or title, or several sections in one call (`"s12,s15,s20"`). Long sections come in pages. Each page says "Page N of M", the first page lists the sub-sections, and every page except the last ends with `[NOT the end of sN …]` and the offset for the next page. A section that is only a heading also returns the sections that follow it. |
 | `search_books(query, book?, category?, limit?)` | Ranked passage search, one result per section. |
 | `grep_books(pattern, book?, category?, regex?, case_sensitive?, limit?)` | Exact or regex line search, for API names, flags and errors. |
 | `read_lines(book, start_line, count?)` | Lines by number, for example around a grep hit. |
@@ -64,12 +65,15 @@ There is also a `books://catalog` resource that holds the whole catalog as markd
 
 - **Book references:** `book` accepts the id (the file stem), a unique part of the title (`"learning go"`) or an acronym (`tlpi`). An unknown name returns the closest matches.
 - **Filters:** in `search_books` and `grep_books`, `book` accepts a comma-separated list, and a fragment such as `rust` selects every matching book.
+- **Search hits** name the chapter a sub-section belongs to (`s1396 … (in s1390)`), so an agent can read the whole chapter.
+- **Result size per client:** results are sized to the client that connects. Claude Code, Claude Desktop, Cursor, VS Code and Codex get up to 32,000 bytes per call, which is a whole chapter in 2–3 pages. Other clients get 9,000 bytes, because some (Antigravity) silently cut tool results above about 10 KB out of the middle. The server logs each client's name and size when it connects. `-page N` or `MCP_BOOKS_PAGE=N` sets one size for all clients. `get_book_toc` and `read_passages` also fill the budget instead of using fixed counts.
+- **Back-of-book indexes** (a section titled "Index" in the last quarter of a book, found in 71 books) are not searched. Their entries list every topic in the book and pushed real passages out of the results.
 - **Logging:** the server prints one line at startup. Add `-v` to log every HTTP request.
 
 ## How it works (`src/library`)
 
 - **Catalog.** `INDEX.json` supplies titles, categories, page counts and source PDFs. Any `.md` file that isn't listed there is still picked up from the folder tree.
-- **Structure.** Markdown headings are parsed and cleaned. The parser skips code blocks, NOTE/TIP boxes, figure and listing captions, page-number headings, and the shell prompts and `#include` lines that the PDF converter turned into headings. Letter-spaced titles (`P R O C E S S E S`) are rebuilt into words using the book's own vocabulary. A chapter title without a number gets one from its first `N.1` section, and a bare "Chapter 7" label is merged with the title that follows it. Heading levels in converted PDFs are inconsistent, so each heading also gets a normalized rank. "Chapter N" and "Part N" headings are placed above ordinary headings, so a chapter covers all of its topics.
+- **Structure.** Markdown headings are parsed and cleaned. The parser skips code blocks, NOTE/TIP boxes, figure and listing captions, page-number headings, and the shell prompts and `#include` lines that the PDF converter turned into headings. Letter-spaced titles (`P R O C E S S E S`) are rebuilt into words using the book's own vocabulary. A chapter title without a number gets one from its first `N.1` section, and a bare "Chapter 7" label is merged with the title that follows it. A heading that only repeats a chapter title inside the printed table of contents is dropped, so a search for "Part 2" finds the real part and not the contents page. Chapter numbers printed on their own line above the title (`**2**`, `## 4`) or at its start (`1 Concurrency…`) become "Chapter N: Title". This only happens when the numbers count up like chapters and the chapters are long enough, so page and list numbers are ignored. Heading levels in converted PDFs are inconsistent, so each heading also gets a normalized rank. "Chapter N" and "Part N" headings are placed above ordinary headings, so a chapter covers all of its topics.
 - **Search.** Every book is split into passages of about 2 KB along section boundaries. Each passage is indexed together with its section and parent titles. Scoring uses BM25 with a bonus for passages that match more of the query terms and for exact phrase matches. Dot-leader lines from printed contents pages are skipped.
 - **Book status.** `ok` means usable. `no_text` means a scanned PDF with no extracted text, which needs OCR. `stub` means a short placeholder. Agents are told to prefer `ok` books.
 
@@ -109,7 +113,7 @@ Run `task bench` to measure on your machine.
 ## Library notes
 
 - **No text (6 books).** These were scanned PDFs, and converting them produced no text: Computer System Architecture (Mano), Rust Crash Course, Data Structures and Algorithms in C (Drozdek), Introduction to Automata Theory (Hopcroft), Docker Up and Running (Schenker), and Higher Engineering Mathematics (Grewal). Re-convert them with OCR to make them searchable.
-- **ByteByteGo case studies.** The 30 files in `ByteByteGo_Case_Studies` all contain the same generic template, not the real case studies, so they are marked `stub`.
+- **ByteByteGo removed (2026-11-23).** The 30 `ByteByteGo_Case_Studies` files held only a generic template (the source PDFs are images with no text), so they were removed together with `ByteByteGo_LinkedIn_Posts_2024`.
 - **Code samples.** Some books lost the spaces inside code blocks during the PDF conversion (`funcdiv(numint,denomint)int{`). That comes from the source conversion and can't be fixed in the server.
 - **Reorganization done on 2026-11-22.** The original index is kept as `books_md/INDEX.json.bak`.
   - Moved `CP_1` and `cp2` (competitive programming books) from Compilers to `Algorithms_and_Data_Structures`.

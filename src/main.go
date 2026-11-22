@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"runtime/debug"
+	"strconv"
 	"syscall"
 	"time"
 
@@ -31,6 +32,7 @@ func main() {
 	callTool := flag.String("call", "", "call one tool from the terminal and print its output, e.g. -call find_books -args '{\"topic\":\"raft\"}'")
 	callArgs := flag.String("args", "{}", "JSON arguments for -call")
 	verbose := flag.Bool("v", false, "log every HTTP request")
+	flag.IntVar(&pageChars, "page", envInt("MCP_BOOKS_PAGE", 0), "result size in bytes for every client ($MCP_BOOKS_PAGE; default: 32000 for Claude, Cursor, VS Code and Codex, 9000 for others)")
 	flag.Parse()
 	log.SetOutput(os.Stderr)
 	log.SetFlags(log.Ltime)
@@ -89,7 +91,7 @@ func main() {
 
 	newServer := func() *mcp.Server {
 		s := mcp.NewServer(&mcp.Implementation{Name: "mcp-books", Title: "Books Library", Version: version},
-			&mcp.ServerOptions{Instructions: instructions})
+			&mcp.ServerOptions{Instructions: instructions, InitializedHandler: logClient})
 		registerTools(s, st)
 		return s
 	}
@@ -218,9 +220,26 @@ func resolveBooksDir(flagVal string) (string, error) {
 
 const instructions = `Library of ~130 readable technical books (Linux/systems, C, Go, Rust, Java, Python, databases, distributed systems, networking, compilers, algorithms, DevOps, security, AI, math). Use these tools, not the books_md files.
 
-1. find_books(topic) or find_books(topics=[...]) to choose books and sections. For a project, pass its parts as separate, specific topics.
-2. find_chapters(query) to find chapters by title across all books; get_book_toc(book) for one book's index;
-   read_section(book, "sN") to read. Read a section before quoting it.
-3. search_books(query) for a specific question; grep_books(pattern) for exact names, flags and errors.
+- A specific question: read_passages(query) returns the full text of the best passages from all books in one call.
+- Which books or chapters cover a topic: find_books(topic), or find_books(topics=[...]) for the parts of a project;
+  find_chapters(query) for chapter titles; get_book_toc(book) for one book's index.
+- Reading: read_section(book, "sN"), or several at once with "s12,s15,s20". If a result ends with
+  [NOT the end of sN ...], keep reading with the given offset before answering.
+- Exact names, flags, errors: grep_books(pattern), then read_lines around a hit.
 
-Use specific terms ("flock fcntl file locking", not "Linux stuff"); a book that matched few of your words is a weak match. Cite as: Book title, Chapter/Section (sN).`
+Results are sized to what your client accepts, so call again when a result says there is more instead of
+answering from part of it. Use specific terms ("flock fcntl file locking", not "Linux stuff"). Cite as: Book title, Chapter/Section (sN).`
+
+func envInt(name string, def int) int {
+	if n, err := strconv.Atoi(os.Getenv(name)); err == nil && n > 0 {
+		return n
+	}
+	return def
+}
+
+// logClient prints which client connected and the result size it gets.
+func logClient(_ context.Context, req *mcp.InitializedRequest) {
+	if p := req.Session.InitializeParams(); p != nil && p.ClientInfo != nil {
+		log.Printf("client %s %s: results up to %d bytes", p.ClientInfo.Name, p.ClientInfo.Version, clientBudget(p.ClientInfo))
+	}
+}

@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -33,6 +34,8 @@ type Section struct {
 	Start  int    // 0-based line of the heading
 	End    int    // 0-based exclusive end line (start of next heading of same/higher level)
 	Chars  int    // bytes covered by [Start, End)
+
+	labelNum, labelLevel int8 // bare chapter number printed just above the heading
 }
 
 // Book is a single markdown book.
@@ -47,6 +50,7 @@ type Book struct {
 	Chars     int // non-whitespace characters of body text
 	Lines     Lines
 	BodyStart int // first line after the generated metadata header
+	IndexAt   int // first line of the back-of-book index (Lines.Len() if none); not searched
 	Sections  []Section
 }
 
@@ -190,6 +194,7 @@ func loadBook(path, rel string, meta indexEntry) (*Book, error) {
 		b.Status = StatusOK
 	}
 	b.Sections = parseSections(b.Lines, b.BodyStart)
+	b.IndexAt = backIndex(b)
 	return b, nil
 }
 
@@ -197,13 +202,21 @@ func loadBook(path, rel string, meta indexEntry) (*Book, error) {
 func parseSections(lines Lines, start int) []Section {
 	var secs []Section
 	inFence := false
+	labelLine, labelNum, labelLevel := -10, 0, 0
 	for i := start; i < lines.Len(); i++ {
 		l := strings.TrimSpace(lines.At(i))
 		if strings.HasPrefix(l, "```") || strings.HasPrefix(l, "~~~") {
 			inFence = !inFence
 			continue
 		}
-		if inFence || len(l) < 3 || l[0] != '#' {
+		if inFence {
+			continue
+		}
+		if m := reBoldNum.FindStringSubmatch(l); m != nil {
+			labelLine, labelNum, labelLevel = i, atoi(m[1]), 0
+			continue
+		}
+		if len(l) < 3 || l[0] != '#' {
 			continue
 		}
 		level, raw, ok := parseHeading(l)
@@ -211,10 +224,19 @@ func parseSections(lines Lines, start int) []Section {
 			continue
 		}
 		title := cleanInline(raw)
+		if m := reChapNum.FindStringSubmatch(title); m != nil {
+			labelLine, labelNum, labelLevel = i, atoi(m[1]), level
+			continue
+		}
 		if isNoiseHeading(title, raw, level) {
 			continue
 		}
-		secs = append(secs, Section{ID: len(secs), Title: title, Level: level, Start: i, Parent: -1})
+		s := Section{ID: len(secs), Title: title, Level: level, Start: i, Parent: -1}
+		if i-labelLine <= 4 {
+			s.labelNum, s.labelLevel = int8(labelNum), int8(labelLevel)
+			labelLine = -10
+		}
+		secs = append(secs, s)
 	}
 
 	// Repair letter-spaced titles using the book's own vocabulary.
@@ -243,7 +265,8 @@ func parseSections(lines Lines, start int) []Section {
 		s.ID = len(merged)
 		merged = append(merged, s)
 	}
-	secs = merged
+	secs = dropPrintedTOC(lines, merged, start)
+	numberChapters(lines, secs)
 
 	for i := 0; i+1 < len(secs); i++ {
 		s, next := &secs[i], secs[i+1]
@@ -484,4 +507,137 @@ func acronym(title string) string {
 		}
 	}
 	return b.String()
+}
+
+// dropPrintedTOC removes headings that belong to a printed table of contents:
+// in the first tenth of the book, followed by page-numbered entries rather
+// than prose, and repeated later as the real heading. Their lines fold into
+// the preceding "Contents" section, so the real chapter is the only match.
+func dropPrintedTOC(lines Lines, secs []Section, start int) []Section {
+	front := start + (lines.Len()-start)/10
+	later := map[string]int{}
+	key := make([]string, len(secs))
+	for i, s := range secs {
+		key[i] = strings.Join(Terms(s.Title), " ")
+		later[key[i]]++
+	}
+	out := secs[:0]
+	for i, s := range secs {
+		later[key[i]]--
+		end := lines.Len()
+		if i+1 < len(secs) {
+			end = secs[i+1].Start
+		}
+		if s.Start < front && key[i] != "" && later[key[i]] > 0 && tocLike(lines, s.Start+1, end) {
+			continue
+		}
+		s.ID = len(out)
+		out = append(out, s)
+	}
+	return out
+}
+
+// tocLike reports whether lines [a, b) read like contents entries
+// (ending in page numbers or dot leaders) rather than prose.
+func tocLike(lines Lines, a, b int) bool {
+	toc, prose := 0, 0
+	for i := a; i < b; i++ {
+		l := strings.TrimSpace(lines.At(i))
+		if strings.Trim(l, "|-: ") == "" {
+			continue
+		}
+		if isTOCLine(l) || rePageEnd.MatchString(l) {
+			toc++
+		} else if len(l) > 60 {
+			prose++
+		}
+	}
+	return toc >= 2 && toc >= 3*prose
+}
+
+// numberChapters finds chapters whose number is printed on its own line
+// above the title ("**2**" or "## 4") or at the start of it ("1 Concurrency"),
+// keeps the longest run that counts up like chapters (so page and figure
+// numbers are ignored), names them "Chapter N: Title" and puts them all at
+// the same heading level.
+func numberChapters(lines Lines, secs []Section) {
+	type cand struct{ sec, num, level int }
+	var cs []cand
+	for i, s := range secs {
+		if chapterKind(s.Title) != 0 || reNumbered.MatchString(s.Title) {
+			continue
+		}
+		if s.labelNum > 0 {
+			lvl := s.Level
+			if s.labelLevel > 0 {
+				lvl = min(lvl, int(s.labelLevel))
+			}
+			cs = append(cs, cand{i, int(s.labelNum), lvl})
+		} else if m := reNumTitle.FindStringSubmatch(s.Title); m != nil {
+			cs = append(cs, cand{i, atoi(m[1]), s.Level})
+		}
+	}
+	// longest chain starting at 1 or 2 where each number is 1 or 2 above the last
+	best, prev := make([]int, len(cs)), make([]int, len(cs))
+	end := -1
+	for i, c := range cs {
+		best[i], prev[i] = 0, -1
+		if c.num <= 2 {
+			best[i] = 1
+		}
+		for j := 0; j < i; j++ {
+			if d := c.num - cs[j].num; (d == 1 || d == 2) && best[j] > 0 && best[j]+1 >= best[i] {
+				best[i], prev[i] = best[j]+1, j
+			}
+		}
+		if best[i] > 0 && (end < 0 || best[i] > best[end]) {
+			end = i
+		}
+	}
+	if end < 0 || best[end] < 3 {
+		return
+	}
+	var chain []cand
+	for i := end; i >= 0; i = prev[i] {
+		chain = append(chain, cs[i])
+	}
+	// real chapters are long; short runs are numbered lists or page furniture
+	first, last := secs[chain[len(chain)-1].sec], secs[chain[0].sec]
+	if lines.Bytes(first.Start, last.Start) < 8000*(len(chain)-1) {
+		return
+	}
+	for i := 1; i < len(chain); i++ {
+		if lines.Bytes(secs[chain[i].sec].Start, secs[chain[i-1].sec].Start) < 1500 {
+			return
+		}
+	}
+	level := 6
+	for _, c := range chain {
+		level = min(level, c.level)
+	}
+	for _, c := range chain {
+		s := &secs[c.sec]
+		title := s.Title
+		if s.labelNum == 0 {
+			title = strings.TrimSpace(title[len(strconv.Itoa(c.num)):])
+		}
+		s.Title = "Chapter " + strconv.Itoa(c.num) + ": " + title
+		s.Level = level
+	}
+}
+
+func atoi(s string) int { n, _ := strconv.Atoi(s); return n }
+
+// backIndex finds the alphabetical index at the end of a book: a section
+// titled "Index" in the last quarter of its text. Its entries list every
+// topic of the book, so searching them only returns noise.
+func backIndex(b *Book) int {
+	n := b.Lines.Len()
+	total := b.Lines.Bytes(b.BodyStart, n)
+	for _, s := range b.Sections {
+		if b.Lines.Bytes(s.Start, n) <= total/4 && reBackIndex.MatchString(s.Title) {
+			return s.Start
+		}
+	}
+	return b.Lines.Len()
 }

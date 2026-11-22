@@ -196,7 +196,7 @@ func indexBook(bi int32, b *Book) bookIndex {
 		n++
 	}
 	emit := func(start, end int) {
-		if end <= start {
+		if end <= start || start >= b.IndexAt {
 			return
 		}
 		n, touched = 0, touched[:0]

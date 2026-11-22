@@ -73,8 +73,20 @@ func TestEndToEnd(t *testing.T) {
 		"Chapter 24: PROCESS CREATION", "Chapter 55: FILE LOCKING")
 	call("get_book_toc", map[string]any{"book": "Learning_Go_Idiomatic_Approach_Jon_Bodner", "filter": "closure"}, "Closures")
 	call("read_section", map[string]any{"book": "Learning_Go_Idiomatic_Approach_Jon_Bodner", "section": "Chapter 5. Functions", "max_chars": 1500},
-		"Sub-sections:", "Closures", "continue:")
+		"Sub-sections:", "Closures", "Page 1 of", "[NOT the end of s")
+	call("read_section", map[string]any{"book": "Asynchronous_Programming_in_Rust_2024", "section": "Chapter 2"},
+		"How Programming Languages Model", "[NOT the end of s")
+	call("get_book_toc", map[string]any{"book": "Asynchronous_Programming_in_Rust_2024", "depth": 2},
+		"Chapter 4: Create Your Own Event Queue", "Chapter 10: Creating Your Own Runtime")
+	call("get_book_toc", map[string]any{"book": "Asynchronous_Programming_in_Rust_2024", "filter": "Part 2"},
+		"1 sections")
+	call("read_section", map[string]any{"book": "head first design", "section": "Decorating Objects"},
+		"almost no text of its own", "Design Eye for the Inheritance")
 	call("search_books", map[string]any{"query": "B-tree page split", "limit": 5}, "Database Internals")
+	call("read_passages", map[string]any{"query": "difference between flock and fcntl record locking"},
+		"The Linux Programming Interface", "--- 3.", "Chapter 55: FILE LOCKING")
+	call("read_section", map[string]any{"book": "tlpi", "section": "s1394,s1396,s1409", "max_chars": 30000},
+		"55.2 File Locking with flock()", "55.2.2 Limitations of flock()", "55.4 Mandatory Locking")
 	call("search_books", map[string]any{"query": "pin unpin future", "book": "rust"}, "Pin")
 	call("grep_books", map[string]any{"pattern": "sync.WaitGroup", "limit": 5}, "lines in")
 	call("grep_books", map[string]any{"pattern": "^Chapter 5\\.", "regex": true, "book": "Learning_Go_Idiomatic_Approach_Jon_Bodner"}, "3454")
@@ -85,5 +97,13 @@ func TestEndToEnd(t *testing.T) {
 	res, err := cs.CallTool(ctx, &mcp.CallToolParams{Name: "get_book_toc", Arguments: map[string]any{"book": "lerning golang idomatic"}})
 	if err != nil || !res.IsError || !strings.Contains(res.Content[0].(*mcp.TextContent).Text, "Closest") {
 		t.Errorf("unknown book should return suggestions, got %v %+v", err, res)
+	}
+}
+
+func TestClientBudget(t *testing.T) {
+	for name, want := range map[string]int{"claude-code": largeBudget, "Visual Studio Code": largeBudget, "cursor-vscode": largeBudget, "antigravity": smallBudget, "": smallBudget} {
+		if got := clientBudget(&mcp.Implementation{Name: name}); got != want {
+			t.Errorf("clientBudget(%q) = %d, want %d", name, got, want)
+		}
 	}
 }

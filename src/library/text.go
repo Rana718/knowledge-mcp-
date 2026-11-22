@@ -126,6 +126,12 @@ var (
 	reShellCmd    = regexp.MustCompile(`^[a-z][a-z0-9_.+-]*\s+(-{1,2}[a-zA-Z]|/|\./|~|\*)`)
 	reBareChapter = regexp.MustCompile(`(?i)^(chapter|part|appendix)\s+([0-9]+|[ivxlc]+|[a-z])\.?$`)
 	reSubOne      = regexp.MustCompile(`^(\d{1,2})\.1(\s|$)`)
+	reBoldNum     = regexp.MustCompile(`^\*\*\s*(\d{1,2})\s*\*\*$`)
+	reChapNum     = regexp.MustCompile(`^(\d{1,2})$`)
+	reNumTitle    = regexp.MustCompile(`^(\d{1,2})\s+\p{Lu}`)
+	reNumbered    = regexp.MustCompile(`^\d+\.\d`)
+	reBackIndex   = regexp.MustCompile(`(?i)^((author|subject|general)\s+)?index(\s+of\s+\w+)?\s*[a-z]?$`)
+	rePageEnd     = regexp.MustCompile(`(^|[\s|*])(\d{1,4}|[ivxlc]{1,7})\**\s*\|?\s*$`)
 	rePart        = regexp.MustCompile(`(?i)^(part|book|volume)\s+([0-9]+|[ivxlc]+|one|two|three|four|five|six|seven|eight|nine|ten)\b`)
 	noiseTitles   = map[string]bool{
 		"note": true, "notes": true, "tip": true, "tips": true, "warning": true, "caution": true,

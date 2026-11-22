@@ -69,9 +69,9 @@ type tocIn struct {
 
 type readSectionIn struct {
 	Book     string `json:"book" jsonschema:"book id or a unique part of its title"`
-	Section  string `json:"section" jsonschema:"section id like 's42', or a section title"`
+	Section  string `json:"section" jsonschema:"section id like 's42' or a title; several ids separated by commas ('s12,s15,s20') are read in one call"`
 	Offset   int    `json:"offset,omitempty" jsonschema:"continue a truncated read from this offset"`
-	MaxChars int    `json:"max_chars,omitempty" jsonschema:"page size in characters (default 12000, max 40000)"`
+	MaxChars int    `json:"max_chars,omitempty" jsonschema:"result size in characters (default: as much as the client accepts, max 40000)"`
 }
 
 type readLinesIn struct {
@@ -85,6 +85,12 @@ type searchIn struct {
 	Book     string `json:"book,omitempty" jsonschema:"limit to books: comma-separated ids or title fragments ('rust' = all Rust books)"`
 	Category string `json:"category,omitempty" jsonschema:"limit to a category"`
 	Limit    int    `json:"limit,omitempty" jsonschema:"max results (default 8, max 30)"`
+}
+
+type passagesIn struct {
+	Query    string `json:"query" jsonschema:"the question, with specific terms, e.g. 'how does flock differ from fcntl locking'"`
+	Book     string `json:"book,omitempty" jsonschema:"limit to books: comma-separated ids or title fragments"`
+	Category string `json:"category,omitempty" jsonschema:"limit to a category"`
 }
 
 type grepIn struct {
@@ -104,7 +110,8 @@ func add[In any](s *mcp.Server, st *state, name, title, desc string, h handler[I
 	no := false
 	tool := &mcp.Tool{Name: name, Description: desc,
 		Annotations: &mcp.ToolAnnotations{Title: title, ReadOnlyHint: true, IdempotentHint: true, OpenWorldHint: &no}}
-	mcp.AddTool(s, tool, func(ctx context.Context, _ *mcp.CallToolRequest, in In) (res *mcp.CallToolResult, _ any, err error) {
+	mcp.AddTool(s, tool, func(ctx context.Context, req *mcp.CallToolRequest, in In) (res *mcp.CallToolResult, _ any, err error) {
+		ctx = context.WithValue(ctx, budgetKey{}, clientBudget(req.ClientInfo()))
 		defer func() {
 			if p := recover(); p != nil {
 				log.Printf("%s: panic: %v", name, p)
@@ -131,7 +138,9 @@ func registerTools(s *mcp.Server, st *state) {
 	add(s, st, "get_book_toc", "Table of contents",
 		"Chapter and section index of a book with section ids (sN) and sizes, plus the book's category, pages and status. Use filter to find sections by title.", bookTOC)
 	add(s, st, "read_section", "Read section",
-		"Read a chapter or section by id ('s42') or title. Long sections come in pages; the result says how to continue and lists the sub-sections.", readSection)
+		"Read a chapter or section by id ('s42') or title. Long sections come in pages: when a page ends with [NOT the end ...], call again with the given offset (or read the listed sub-sections) before answering.", readSection)
+	add(s, st, "read_passages", "Read best passages",
+		"Answer a specific question in one call: returns the full text (not snippets) of the best-matching passages across the library, as many as fit, each with book, chapter and section id for citing. Use read_section afterwards only if you need a whole chapter.", readPassages)
 	add(s, st, "search_books", "Search passages",
 		"Ranked passage search for a specific question, over all books or only some. One result per section, with section id and snippet.", searchBooks)
 	add(s, st, "grep_books", "Grep",
@@ -244,6 +253,16 @@ func truncateStr(s string, n int) string {
 // where formats "s12 Chapter › Section" for a line of a book.
 func where(b *library.Book, line int) string {
 	if s := b.SectionAt(line); s != nil {
+		top := s
+		for top.Parent >= 0 {
+			top = &b.Sections[top.Parent]
+		}
+		switch {
+		case top.ID == s.Parent:
+			return fmt.Sprintf("s%d %s (in s%d)", s.ID, b.Breadcrumb(s, 2), top.ID)
+		case top != s:
+			return fmt.Sprintf("s%d %s (in s%d %s)", s.ID, b.Breadcrumb(s, 2), top.ID, top.Title)
+		}
 		return fmt.Sprintf("s%d %s", s.ID, b.Breadcrumb(s, 2))
 	}
 	return fmt.Sprintf("line %d", line+1)
@@ -500,7 +519,7 @@ func autoDepth(b *library.Book) int {
 	return d
 }
 
-func bookTOC(_ context.Context, lib *library.Library, in tocIn) (string, error) {
+func bookTOC(ctx context.Context, lib *library.Library, in tocIn) (string, error) {
 	b, err := lib.Book(in.Book)
 	if err != nil {
 		return "", err
@@ -525,81 +544,208 @@ func bookTOC(_ context.Context, lib *library.Library, in tocIn) (string, error) 
 	} else {
 		fmt.Fprintf(&sb, "%d of %d sections (depth %d):\n\n", len(entries), len(b.Sections), depth)
 	}
-	const pageSize = 250
-	offset := max(0, in.Offset)
-	end := min(len(entries), offset+pageSize)
-	for _, s := range entries[min(offset, end):end] {
+	offset := min(max(0, in.Offset), len(entries))
+	end, room := offset, budget(ctx)-200
+	for ; end < len(entries) && sb.Len() < room; end++ {
+		s := entries[end]
 		indent := ""
 		if in.Filter == "" {
 			indent = strings.Repeat("  ", s.Rank)
 		}
-		fmt.Fprintf(&sb, "%ss%d %s (%s)\n", indent, s.ID, s.Title, size(s.Chars))
+		fmt.Fprintf(&sb, "%ss%d %s (%s)\n", indent, s.ID, truncateStr(s.Title, 100), size(s.Chars))
 	}
 	if end < len(entries) {
-		fmt.Fprintf(&sb, "\n%d more: offset=%d\n", len(entries)-end, end)
+		fmt.Fprintf(&sb, "\n[%d more entries: get_book_toc(book=%q, offset=%d)]\n", len(entries)-end, b.ID, end)
 	}
 	return sb.String(), nil
 }
 
-func readSection(_ context.Context, lib *library.Library, in readSectionIn) (string, error) {
+// pageChars, when set (-page), fixes the output size for every client.
+var pageChars = 0
+
+// Output budget per tool result, in bytes. Some clients (Antigravity) cut
+// results above ~10 KB out of the middle, so unknown clients get a safe size;
+// clients known to take long results get more per call.
+const (
+	smallBudget = 9000
+	largeBudget = 32000
+)
+
+type budgetKey struct{}
+
+func budget(ctx context.Context) int {
+	if n, ok := ctx.Value(budgetKey{}).(int); ok {
+		return n
+	}
+	return smallBudget
+}
+
+func clientBudget(info *mcp.Implementation) int {
+	if pageChars > 0 {
+		return pageChars
+	}
+	if info != nil {
+		name := strings.ToLower(info.Name)
+		for _, c := range []string{"claude", "cursor", "visual studio code", "vscode", "codex"} {
+			if strings.Contains(name, c) {
+				return largeBudget
+			}
+		}
+	}
+	return smallBudget
+}
+
+func readSection(ctx context.Context, lib *library.Library, in readSectionIn) (string, error) {
 	b, err := lib.Book(in.Book)
 	if err != nil {
 		return "", err
 	}
-	s, err := b.Section(in.Section)
-	if err != nil {
-		return "", err
+	limit := clamp(in.MaxChars, budget(ctx), 1000, 40000)
+	refs := strings.Split(in.Section, ",")
+	if len(refs) == 1 {
+		s, err := b.Section(in.Section)
+		if err != nil {
+			return "", err
+		}
+		return readOne(b, s, in.Offset, limit), nil
 	}
-	text := cleanText(sectionText(b, s))
-	maxChars := clamp(in.MaxChars, 12000, 1000, 40000)
-	offset := max(0, in.Offset)
+	// several sections: read them in order while they fit
+	var sb strings.Builder
+	var unread []string
+	for _, ref := range refs {
+		ref = strings.TrimSpace(ref)
+		s, err := b.Section(ref)
+		if err != nil {
+			fmt.Fprintf(&sb, "\n[%s: %v]\n", ref, err)
+			continue
+		}
+		left := limit - sb.Len()
+		if left < 1500 {
+			unread = append(unread, fmt.Sprintf("s%d", s.ID))
+			continue
+		}
+		if sb.Len() > 0 {
+			sb.WriteString("\n\n==========\n\n")
+		}
+		sb.WriteString(readOne(b, s, 0, left))
+	}
+	if len(unread) > 0 {
+		fmt.Fprintf(&sb, "\n\n[No room for %s in this result: read_section(book=%q, section=%q)]", strings.Join(unread, ", "), b.ID, strings.Join(unread, ","))
+	}
+	return sb.String(), nil
+}
+
+// readOne renders one page of a section; the result fits in limit bytes.
+func readOne(b *library.Book, s *library.Section, offset, limit int) string {
+	span, note := *s, ""
+	if last := shortSpan(b, s); last > s.ID {
+		span.End = b.Sections[last].End
+		note = fmt.Sprintf("s%d has almost no text of its own; this includes s%d-s%d that follow it.\n", s.ID, s.ID+1, last)
+	}
+	text := cleanText(sectionText(b, &span))
+	offset = max(0, offset)
 	if offset >= len(text) {
-		return fmt.Sprintf("offset %d is past the end of s%d (%d chars)", offset, s.ID, len(text)), nil
+		return fmt.Sprintf("offset %d is past the end of s%d (%d chars)", offset, s.ID, len(text))
 	}
+
+	// The whole result, header and footer included, fits in limit.
+	var head strings.Builder
+	head.WriteString(note)
+	if offset == 0 && len(text) > limit {
+		// list sub-sections so the agent can jump straight to the relevant one
+		var subs []string
+		n := 0
+		for i := s.ID + 1; i < len(b.Sections) && b.Sections[i].Start < s.End && n < limit/8; i++ {
+			if c := b.Sections[i]; c.Parent == s.ID {
+				e := fmt.Sprintf("s%d %s (%s)", c.ID, truncateStr(c.Title, 60), size(c.Chars))
+				subs, n = append(subs, e), n+len(e)+3
+			}
+		}
+		if len(subs) > 0 {
+			head.WriteString("Sub-sections: " + strings.Join(subs, " · ") + "\n")
+		}
+	}
+	title := fmt.Sprintf("%s — s%d %s", b.Title, s.ID, b.Breadcrumb(s, 3))
+	budget := max(500, limit-len(title)-head.Len()-450)
 	page := text[offset:]
 	next := -1
-	if len(page) > maxChars {
-		cut := maxChars
-		if nl := strings.LastIndex(page[:cut], "\n"); nl > maxChars/2 {
-			cut = nl
-		}
-		for cut > 0 && (page[cut]&0xC0) == 0x80 {
-			cut--
-		}
+	if len(page) > budget {
+		cut := pageCut(page, budget)
 		page, next = page[:cut], offset+cut
 	}
 
 	var sb strings.Builder
-	fmt.Fprintf(&sb, "%s — s%d %s", b.Title, s.ID, b.Breadcrumb(s, 3))
+	sb.WriteString(title)
 	if next >= 0 || offset > 0 {
-		fmt.Fprintf(&sb, " (chars %d-%d of %d)", offset, offset+len(page), len(text))
-	}
-	sb.WriteString("\n")
-	// On the first page of a long section, list its sub-sections so the
-	// agent can jump straight to the relevant one.
-	if offset == 0 && next >= 0 {
-		var subs []string
-		for i := s.ID + 1; i < len(b.Sections) && b.Sections[i].Start < s.End && len(subs) < 40; i++ {
-			if c := b.Sections[i]; c.Parent == s.ID {
-				subs = append(subs, fmt.Sprintf("s%d %s (%s)", c.ID, c.Title, size(c.Chars)))
-			}
-		}
-		if len(subs) > 0 {
-			sb.WriteString("Sub-sections: " + strings.Join(subs, " · ") + "\n")
+		per := max(500, limit-len(title)-450) // a later page, without the sub-section list
+		fmt.Fprintf(&sb, "\nPage %d of about %d (chars %d-%d of %d).", 1+(offset+per/2)/per, 1+(len(text)-1)/per, offset, offset+len(page), len(text))
+		if next >= 0 {
+			fmt.Fprintf(&sb, " The section continues after this page: read_section(book=%q, section=\"s%d\", offset=%d).", b.ID, s.ID, next)
 		}
 	}
+	sb.WriteString("\n" + head.String())
 	sb.WriteString("\n" + page)
 	if next >= 0 {
-		fmt.Fprintf(&sb, "\n\n[continue: read_section(book=%q, section=\"s%d\", offset=%d)]", b.ID, s.ID, next)
-	} else {
-		for i := s.ID + 1; i < len(b.Sections); i++ {
-			if b.Sections[i].Start >= s.End {
-				fmt.Fprintf(&sb, "\n\n[end of section; next: s%d %s]", i, b.Sections[i].Title)
-				break
-			}
+		fmt.Fprintf(&sb, "\n\n[NOT the end of s%d: %s more. Continue with read_section(book=%q, section=\"s%d\", offset=%d)%s]",
+			s.ID, size(len(text)-next), b.ID, s.ID, next, nextHeading(text[next:]))
+		return sb.String()
+	}
+	for i := span.ID + 1; i < len(b.Sections); i++ {
+		if c := b.Sections[i]; c.Start >= span.End {
+			fmt.Fprintf(&sb, "\n\n[end of s%d; next section: s%d %s]", s.ID, i, c.Title)
+			break
 		}
 	}
-	return sb.String(), nil
+	if s.Parent >= 0 {
+		p := b.Sections[s.Parent]
+		fmt.Fprintf(&sb, "\n[part of s%d %s (%s)]", p.ID, p.Title, size(p.Chars))
+	}
+	return sb.String()
+}
+
+// shortSpan returns the last section to read along with s when s is only a
+// heading (no sub-sections, a few hundred bytes), so the reader gets the text
+// that follows instead of an empty page. It returns s.ID otherwise.
+func shortSpan(b *library.Book, s *library.Section) int {
+	if s.Chars >= 400 || (s.ID+1 < len(b.Sections) && b.Sections[s.ID+1].Parent == s.ID) {
+		return s.ID
+	}
+	last, total := s.ID, s.Chars
+	for i := s.ID + 1; i < len(b.Sections) && total < 3000; i++ {
+		c := b.Sections[i]
+		if c.Parent != s.Parent || c.Rank < s.Rank || c.Chars > 20000 {
+			break
+		}
+		last, total = i, total+c.Chars
+	}
+	return last
+}
+
+// pageCut picks where a page ends: at a sub-heading in the second half of
+// the page if there is one, else at a paragraph or line break.
+func pageCut(page string, max int) int {
+	w := page[:max]
+	for _, sep := range []string{"\n#", "\n\n", "\n"} {
+		if i := strings.LastIndex(w, sep); i > max/2 {
+			return i + 1
+		}
+	}
+	for max > 0 && (page[max]&0xC0) == 0x80 {
+		max--
+	}
+	return max
+}
+
+// nextHeading names the first heading in rest, for the continue hint.
+func nextHeading(rest string) string {
+	for line := range strings.Lines(rest) {
+		// sectionText writes real headings as clean titles; raw ones left in
+		// the text (callouts, captions) still carry markup
+		if t := strings.TrimSpace(strings.TrimLeft(line, "# ")); strings.HasPrefix(line, "#") && len(t) > 3 && !strings.ContainsAny(t, "*_<") {
+			return "; it goes on with " + t
+		}
+	}
+	return ""
 }
 
 // sectionText joins a section's lines, writing headings as clean titles
@@ -657,6 +803,9 @@ func searchBooks(_ context.Context, lib *library.Library, in searchIn) (string, 
 	seen := map[string]bool{}
 	n := 0
 	for _, h := range lib.Search(in.Query, allow, limit*4) {
+		if allow == nil && h.Book.Status != library.StatusOK {
+			continue
+		}
 		snip, line := library.Snippet(h.Book, h.Start, h.End, in.Query, 300)
 		w := where(h.Book, line)
 		if key := h.Book.ID + w; seen[key] {
@@ -764,4 +913,84 @@ func grepBooks(ctx context.Context, lib *library.Library, in grepIn) (string, er
 		head += " (limit reached; narrow with book or category)"
 	}
 	return head + ":\n" + sb.String(), nil
+}
+
+// readPassages returns the full text of the best passages for a question,
+// as many as fit the client's budget, with neighbouring hits merged and at
+// most three passages per book (unless the search is limited to books).
+func readPassages(ctx context.Context, lib *library.Library, in passagesIn) (string, error) {
+	if strings.TrimSpace(in.Query) == "" {
+		return "", fmt.Errorf("query is required")
+	}
+	allow, err := bookFilter(lib, in.Book, in.Category)
+	if err != nil {
+		return "", err
+	}
+	type span struct {
+		b          *library.Book
+		start, end int
+		hs, he     int // the best hit inside the span
+	}
+	var spans []span
+	perBook := map[*library.Book]int{}
+	nTerms := len(library.Terms(in.Query))
+	for _, h := range lib.Search(in.Query, allow, 80) {
+		if allow == nil && h.Book.Status != library.StatusOK {
+			continue
+		}
+		if len(spans) >= 2 && h.Matched*2 < nTerms {
+			continue // weak match
+		}
+		merged := false
+		for i := range spans {
+			if sp := &spans[i]; sp.b == h.Book && h.Start <= sp.end+2 && h.End >= sp.start-2 {
+				sp.start, sp.end, merged = min(sp.start, h.Start), max(sp.end, h.End), true
+				break
+			}
+		}
+		if !merged && (allow != nil || perBook[h.Book] < 3) {
+			spans = append(spans, span{h.Book, h.Start, h.End, h.Start, h.End})
+			perBook[h.Book]++
+		}
+	}
+	if len(spans) == 0 {
+		return fmt.Sprintf("No passages match %q. Try other keywords, find_chapters, or grep_books for exact text.", in.Query), nil
+	}
+
+	room := budget(ctx) - 900             // leave space for the footer
+	maxPassage := max(2500, (room-300)/3) // at least three passages fit
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "Best passages for %q:\n", in.Query)
+	var skipped []string
+	shown := 0
+	for _, sp := range spans {
+		sec := sp.b.SectionAt(sp.start)
+		if sec == nil {
+			continue
+		}
+		render := func(a, e int) string {
+			part := library.Section{ID: sec.ID, Rank: sec.Rank, Start: a, End: e}
+			return strings.TrimSpace(cleanText(sectionText(sp.b, &part)))
+		}
+		text := render(sp.start, sp.end)
+		if len(text) > maxPassage { // keep the best-matching part
+			sp.start, sp.end = sp.hs, sp.he
+			text = render(sp.start, sp.end)
+		}
+		head := fmt.Sprintf("\n--- %d. %s — %s (id: %s, lines %d-%d)\n", shown+1, sp.b.Title, where(sp.b, sp.start), sp.b.ID, sp.start+1, sp.end)
+		left := min(maxPassage, room-sb.Len()-len(head))
+		if left < 800 {
+			skipped = append(skipped, fmt.Sprintf("%s s%d", sp.b.ID, sec.ID))
+			continue
+		}
+		if len(text) > left {
+			text = truncateStr(text[:pageCut(text, left-20)], left) + " [cut; read_section for the rest]"
+		}
+		sb.WriteString(head + text + "\n")
+		shown++
+	}
+	if len(skipped) > 0 {
+		fmt.Fprintf(&sb, "\n[%d more matching passages did not fit: %s. Read them with read_section(book, \"sN\").]", len(skipped), strings.Join(skipped[:min(8, len(skipped))], "; "))
+	}
+	return sb.String(), nil
 }
