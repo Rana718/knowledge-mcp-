@@ -56,6 +56,39 @@ There is also a `books://catalog` resource that holds the whole catalog as markd
 - **Search.** Every book is split into passages of about 2 KB along section boundaries. Each passage is indexed together with its section and parent titles. Scoring uses BM25 with a bonus for passages that match more of the query terms and for exact phrase matches. Dot-leader lines from printed contents pages are skipped.
 - **Book status.** `ok` means usable. `no_text` means a scanned PDF with no extracted text, which needs OCR. `stub` means a short placeholder. Agents are told to prefer `ok` books.
 
+## Performance
+
+Measured on this library (122 MB of markdown, 163 books, 12-core machine):
+
+| | Before tuning | Now |
+|---|---|---|
+| RAM while idle (RSS) | 690 MB | ~200 MB |
+| Peak RAM at startup | 690 MB | ~320 MB |
+| Startup CPU time / wall time | ~6 s / 0.9 s | ~2.6 s / 0.6 s |
+| `search_books` (full tool call) | 11–21 ms | ~0.5–1 ms |
+| `find_books`, one topic / five topics | 4–5 ms / 2.6 ms+ | ~0.7 ms / ~1 ms |
+| `find_chapters` | 0.9 ms | ~0.15 ms |
+| `grep_books`, plain text over all books | 5.3 s | ~10–12 ms |
+| `grep_books`, regex over all books | 1.5 s | ~7–8 ms |
+
+What changed, following *100 Go Mistakes* (#21 slice preallocation, #28 maps, sync.Pool) and *Learning Go* (GC workload, GOGC/GOMEMLIMIT):
+
+- **Text and lines:** each book is one string plus a 4-byte offset per line. Files are not copied a second time.
+- **Search index:** posting lists are varint-encoded in a single byte slice (14 MB for 6.7M postings) and built with exact preallocation. The index holds no pointers apart from the term dictionary, so GC has little to scan.
+- **Tokenizing:** no string is allocated per word, and stop words share the dictionary lookup.
+- **Queries:** score buffers are reused through `sync.Pool`, and only the top results are kept in a heap.
+- **Grep:**
+  - Plain-text patterns jump to the pattern's rarest byte (by measured byte frequency in the books) with a vectorized `IndexByte`, instead of running a `(?i)` regexp on every line.
+  - For regexes, the required literal (e.g. `sync.` in `sync\.(Wait|Mutex)`) is found first, and the regexp runs only on those lines.
+  - Books are searched in parallel batches, and the search stops once the limit is reached.
+- **Other tools:**
+  - `find_chapters` uses an inverted index of title words.
+  - Multi-topic `find_books` ranks its topics in parallel.
+  - Exact-phrase checks reuse the fast case-insensitive finder instead of lowercasing passages.
+- **GC:** after indexing the server returns the garbage to the OS (`debug.FreeOSMemory`) and runs with `GOGC=40`. Set `GOGC` or `GOMEMLIMIT` in the environment to override.
+
+Run `task bench` to measure on your machine.
+
 ## Library notes
 
 - **No text (6 books).** These were scanned PDFs, and converting them produced no text: Computer System Architecture (Mano), Rust Crash Course, Data Structures and Algorithms in C (Drozdek), Introduction to Automata Theory (Hopcroft), Docker Up and Running (Schenker), and Higher Engineering Mathematics (Grewal). Re-convert them with OCR to make them searchable.

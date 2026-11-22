@@ -72,6 +72,12 @@ tasks:
     cmds:
       - claude mcp add books -s user -- {{.BIN}} -books {{.BOOKS}}
 
+  bench:
+    desc: Memory report and benchmarks for loading, search, ranking and grep
+    cmds:
+      - go test ./src/library -run TestMemoryReport -v
+      - go test ./src/library ./src -run XXX -bench . -benchtime 30x
+
   fmt:
     desc: Format and vet the Go code
     cmds:

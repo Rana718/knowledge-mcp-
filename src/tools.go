@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"regexp"
+	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -392,10 +393,22 @@ func findMany(lib *library.Library, topics []string, allow func(*library.Book) b
 		topics []string
 		score  float64
 	}
+	// rank all topics in parallel; the index is read-only
+	rankings := make([][]library.BookScore, len(topics))
+	var wg sync.WaitGroup
+	for i, topic := range topics {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			rankings[i] = lib.RankBooks(topic, allow, per, 1)
+		}()
+	}
+	wg.Wait()
+
 	byBook := map[*library.Book]*cover{}
 	var detail strings.Builder
 	for ti, topic := range topics {
-		ranked := lib.RankBooks(topic, allow, per, 1)
+		ranked := rankings[ti]
 		fmt.Fprintf(&detail, "\n%d. %s\n", ti+1, topic)
 		if len(ranked) == 0 {
 			detail.WriteString("   no matching books\n")
@@ -602,7 +615,7 @@ func sectionText(b *library.Book, s *library.Section) string {
 			sb.WriteString(strings.Repeat("#", min(6, 1+h.Rank-s.Rank+1)) + " " + h.Title + "\n")
 			continue
 		}
-		sb.WriteString(b.Lines[i])
+		sb.WriteString(b.Lines.At(i))
 		sb.WriteByte('\n')
 	}
 	return sb.String()
@@ -614,18 +627,18 @@ func readLines(_ context.Context, lib *library.Library, in readLinesIn) (string,
 		return "", err
 	}
 	start := max(1, in.StartLine)
-	if start > len(b.Lines) {
-		return "", fmt.Errorf("start_line %d is past the end (%d lines)", start, len(b.Lines))
+	if start > b.Lines.Len() {
+		return "", fmt.Errorf("start_line %d is past the end (%d lines)", start, b.Lines.Len())
 	}
-	end := min(len(b.Lines), start-1+clamp(in.Count, 80, 1, 400))
+	end := min(b.Lines.Len(), start-1+clamp(in.Count, 80, 1, 400))
 	var sb strings.Builder
 	fmt.Fprintf(&sb, "%s, lines %d-%d (%s)\n", b.Title, start, end, where(b, start-1))
 	for i := start - 1; i < end; i++ {
-		if l := cleanText(b.Lines[i]); strings.TrimSpace(l) != "" {
+		if l := cleanText(b.Lines.At(i)); strings.TrimSpace(l) != "" {
 			fmt.Fprintf(&sb, "%d: %s\n", i+1, l)
 		}
 	}
-	if end < len(b.Lines) {
+	if end < b.Lines.Len() {
 		fmt.Fprintf(&sb, "[continue: start_line=%d]", end+1)
 	}
 	return sb.String(), nil
@@ -667,65 +680,80 @@ func grepBooks(ctx context.Context, lib *library.Library, in grepIn) (string, er
 	if in.Pattern == "" {
 		return "", fmt.Errorf("pattern is required")
 	}
-	expr := in.Pattern
-	if !in.Regex {
-		expr = regexp.QuoteMeta(expr)
-	}
-	if !in.CaseSensitive {
-		expr = "(?i)" + expr
-	}
-	re, err := regexp.Compile(expr)
-	if err != nil {
-		return "", fmt.Errorf("invalid regex: %w", err)
+	find, ok := library.LiteralFinder(in.Pattern, !in.CaseSensitive)
+	if in.Regex || !ok {
+		expr := in.Pattern
+		if !in.Regex {
+			expr = regexp.QuoteMeta(expr)
+		}
+		flags := "(?m)"
+		if !in.CaseSensitive {
+			flags = "(?mi)"
+		}
+		re, err := regexp.Compile(flags + expr)
+		if err != nil {
+			return "", fmt.Errorf("invalid regex: %w", err)
+		}
+		find = library.RegexFinder(re)
 	}
 	allow, err := bookFilter(lib, in.Book, in.Category)
 	if err != nil {
 		return "", err
 	}
 	limit := clamp(in.Limit, 30, 1, 200)
+	var todo []*library.Book
+	for _, b := range lib.Books {
+		if allow == nil || allow(b) {
+			todo = append(todo, b)
+		}
+	}
+	// Search books in parallel, a batch at a time, and print in book order;
+	// stop as soon as the limit is reached.
+	workers := max(2, runtime.NumCPU()/2)
 	var sb strings.Builder
 	n, books, more := 0, 0, false
-	for _, b := range lib.Books {
+	for start := 0; start < len(todo) && !more; start += workers {
 		if ctx.Err() != nil {
 			return "", ctx.Err()
 		}
-		if allow != nil && !allow(b) {
-			continue
+		batch := todo[start:min(len(todo), start+workers)]
+		results := make([][]library.GrepMatch, len(batch))
+		want := limit - n + 1
+		var wg sync.WaitGroup
+		for i, b := range batch {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				results[i] = b.Grep(find, want)
+			}()
 		}
-		first := true
-		for i := b.BodyStart; i < len(b.Lines); i++ {
-			l := b.Lines[i]
-			loc := re.FindStringIndex(l)
-			if loc == nil && strings.ContainsAny(l, "#*_`<") {
-				// also match heading text without markdown ("## **Chapter 5**")
-				l = library.CleanLine(l)
-				loc = re.FindStringIndex(l)
-			}
-			if loc == nil {
+		wg.Wait()
+		for i, ms := range results {
+			if len(ms) == 0 {
 				continue
 			}
-			if n == limit {
-				more = true
+			b := batch[i]
+			fmt.Fprintf(&sb, "\n%s (id: %s)\n", b.Title, b.ID)
+			books++
+			for _, m := range ms {
+				if n == limit {
+					more = true
+					break
+				}
+				from := max(0, m.At-120)
+				for from > 0 && (m.Text[from]&0xC0) == 0x80 {
+					from--
+				}
+				line := strings.TrimSpace(cleanText(m.Text[from:]))
+				if from > 0 {
+					line = "…" + line
+				}
+				fmt.Fprintf(&sb, "%d [%s]: %s\n", m.Line+1, truncateStr(where(b, m.Line), 70), truncateStr(line, 300))
+				n++
+			}
+			if more {
 				break
 			}
-			if first {
-				fmt.Fprintf(&sb, "\n%s (id: %s)\n", b.Title, b.ID)
-				first = false
-				books++
-			}
-			from := max(0, loc[0]-120)
-			for from > 0 && (l[from]&0xC0) == 0x80 {
-				from--
-			}
-			line := strings.TrimSpace(cleanText(l[from:]))
-			if from > 0 {
-				line = "…" + line
-			}
-			fmt.Fprintf(&sb, "%d [%s]: %s\n", i+1, truncateStr(where(b, i), 70), truncateStr(line, 300))
-			n++
-		}
-		if more {
-			break
 		}
 	}
 	if n == 0 {

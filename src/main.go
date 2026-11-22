@@ -12,6 +12,8 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime"
+	"runtime/debug"
 	"syscall"
 	"time"
 
@@ -33,6 +35,13 @@ func main() {
 	log.SetOutput(os.Stderr)
 	log.SetFlags(log.Ltime)
 	log.SetPrefix("mcp-books ")
+
+	// The heap is mostly long-lived book text and queries allocate little,
+	// so a lower GOGC keeps memory near the live size at almost no CPU cost.
+	// GOGC / GOMEMLIMIT in the environment still take precedence.
+	if os.Getenv("GOGC") == "" {
+		debug.SetGCPercent(40)
+	}
 
 	root, err := resolveBooksDir(*booksDir)
 	if err != nil {
@@ -68,7 +77,12 @@ func main() {
 		if err != nil {
 			log.Printf("loading %s failed: %v", root, err)
 		} else {
-			log.Printf("ready: %d books indexed in %s", len(lib.Books), lib.LoadTime.Round(time.Millisecond))
+			// Indexing leaves a few hundred MB of garbage: collect it and give
+			// the pages back to the OS so the resident size matches live data.
+			debug.FreeOSMemory()
+			var ms runtime.MemStats
+			runtime.ReadMemStats(&ms)
+			log.Printf("ready: %d books indexed in %s, heap %d MB", len(lib.Books), lib.LoadTime.Round(time.Millisecond), ms.HeapAlloc>>20)
 		}
 		st.set(lib, err)
 	}()
@@ -104,7 +118,7 @@ func main() {
 			handler = logRequests(mux)
 		}
 		srv := &http.Server{Addr: *httpAddr, Handler: handler}
-		go func() { <-ctx.Done(); srv.Close() }()
+		go func() { <-ctx.Done(); _ = srv.Close() }()
 		log.Printf("listening on http://%s/mcp", *httpAddr)
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Fatal(err)
@@ -139,7 +153,7 @@ func runCall(root, name, args string) error {
 	if err != nil {
 		return err
 	}
-	defer cs.Close()
+	defer func() { _ = cs.Close() }()
 	res, err := cs.CallTool(ctx, &mcp.CallToolParams{Name: name, Arguments: in})
 	if err != nil {
 		return err

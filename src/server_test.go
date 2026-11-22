@@ -40,7 +40,7 @@ func TestEndToEnd(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer cs.Close()
+	defer func() { _ = cs.Close() }()
 
 	call := func(name string, args map[string]any, want ...string) string {
 		t.Helper()

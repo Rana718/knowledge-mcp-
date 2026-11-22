@@ -1,8 +1,8 @@
 package library
 
 import (
+	"encoding/binary"
 	"math"
-	"runtime"
 	"sort"
 	"strings"
 	"sync"
@@ -18,31 +18,40 @@ const (
 type chunk struct {
 	book       int32
 	start, end int32 // line range [start, end)
-	length     uint32
 }
 
-type posting struct {
-	chunk uint32
-	tf    uint16
-}
-
-// Index is an in-memory BM25 inverted index over book chunks.
+// Index is a BM25 inverted index over book chunks. Posting lists are stored
+// back to back in one byte slice as (varint chunk delta, tf byte) pairs, so
+// the whole index holds no pointers except the term dictionary.
 type Index struct {
-	books    []*Book
-	chunks   []chunk
-	postings map[string][]posting
-	avgLen   float64
+	books  []*Book
+	chunks []chunk
+	norm   []float32 // per chunk: k1 * (1 - b + b*len/avgLen)
+	dict   map[string]uint32
+	df     []uint32
+	off    []uint32 // postings of term t are data[off[t]:off[t+1]]
+	data   []byte
+	titles [][]string // per book: title and category terms
 }
 
+// bookIndex is the per-book result of indexing, merged into Index later.
 type bookIndex struct {
-	chunks   []chunk
-	postings map[string][]posting
+	chunks  []chunk
+	lengths []uint32
+	terms   []string // local term id -> term
+	termOff []uint32 // postings of local term t: post[termOff[t]:termOff[t+1]]
+	post    []localPosting
 }
 
-func buildIndex(books []*Book) *Index {
+type localPosting struct {
+	chunk uint32 // chunk id inside the book
+	tf    uint8
+}
+
+func buildIndex(books []*Book, workers int) *Index {
 	parts := make([]bookIndex, len(books))
 	var wg sync.WaitGroup
-	sem := make(chan struct{}, runtime.NumCPU())
+	sem := make(chan struct{}, workers)
 	for i, b := range books {
 		wg.Add(1)
 		go func() {
@@ -54,30 +63,89 @@ func buildIndex(books []*Book) *Index {
 	}
 	wg.Wait()
 
-	idx := &Index{books: books, postings: make(map[string][]posting, 1<<20)}
-	var total float64
+	x := &Index{books: books, dict: map[string]uint32{}}
+	nChunks, nLocalTerms := 0, 0
 	for _, p := range parts {
-		base := uint32(len(idx.chunks))
-		for _, c := range p.chunks {
-			total += float64(c.length)
-		}
-		idx.chunks = append(idx.chunks, p.chunks...)
-		for term, ps := range p.postings {
-			dst := idx.postings[term]
-			for _, q := range ps {
-				dst = append(dst, posting{chunk: q.chunk + base, tf: q.tf})
+		nChunks += len(p.chunks)
+		nLocalTerms += len(p.terms)
+	}
+
+	// Global term ids, and per term: number of postings and encoded size.
+	x.chunks = make([]chunk, 0, nChunks)
+	lengths := make([]uint32, 0, nChunks)
+	gids := make([][]uint32, len(parts))
+	var size []uint32
+	last := []int64{}
+	var tmp [binary.MaxVarintLen32]byte
+	for bi, p := range parts {
+		base := uint32(len(x.chunks))
+		x.chunks = append(x.chunks, p.chunks...)
+		lengths = append(lengths, p.lengths...)
+		gids[bi] = make([]uint32, len(p.terms))
+		for lt, t := range p.terms {
+			g, ok := x.dict[t]
+			if !ok {
+				g = uint32(len(x.df))
+				x.dict[t] = g
+				x.df = append(x.df, 0)
+				size = append(size, 0)
+				last = append(last, -1)
 			}
-			idx.postings[term] = dst
+			gids[bi][lt] = g
+			for _, q := range p.post[p.termOff[lt]:p.termOff[lt+1]] {
+				c := int64(base + q.chunk)
+				size[g] += uint32(binary.PutUvarint(tmp[:], uint64(c-last[g]-1))) + 1
+				last[g] = c
+				x.df[g]++
+			}
 		}
 	}
-	if len(idx.chunks) > 0 {
-		idx.avgLen = total / float64(len(idx.chunks))
+
+	// Lay out and encode all posting lists in one allocation.
+	x.off = make([]uint32, len(x.df)+1)
+	for g, n := range size {
+		x.off[g+1] = x.off[g] + n
 	}
-	return idx
+	x.data = make([]byte, x.off[len(x.df)])
+	pos := make([]uint32, len(x.df))
+	copy(pos, x.off)
+	for g := range last {
+		last[g] = -1
+	}
+	base := uint32(0)
+	for bi, p := range parts {
+		for lt := range p.terms {
+			g := gids[bi][lt]
+			for _, q := range p.post[p.termOff[lt]:p.termOff[lt+1]] {
+				c := int64(base + q.chunk)
+				pos[g] += uint32(binary.PutUvarint(x.data[pos[g]:], uint64(c-last[g]-1)))
+				x.data[pos[g]] = q.tf
+				pos[g]++
+				last[g] = c
+			}
+		}
+		base += uint32(len(p.chunks))
+		parts[bi] = bookIndex{} // release as we go
+	}
+
+	var total float64
+	for _, n := range lengths {
+		total += float64(n)
+	}
+	avg := max(1, total/float64(max(1, len(lengths))))
+	x.norm = make([]float32, len(lengths))
+	for i, n := range lengths {
+		x.norm[i] = float32(bm25K1 * (1 - bm25B + bm25B*float64(n)/avg))
+	}
+	x.titles = make([][]string, len(books))
+	for i, b := range books {
+		x.titles[i] = Terms(b.Title + " " + b.Category)
+	}
+	return x
 }
 
 func indexBook(bi int32, b *Book) bookIndex {
-	out := bookIndex{postings: map[string][]posting{}}
+	var out bookIndex
 	if b.Status == StatusNoText {
 		return out
 	}
@@ -85,53 +153,108 @@ func indexBook(bi int32, b *Book) bookIndex {
 	for _, s := range b.Sections {
 		isStart[s.Start] = true
 	}
-	tf := map[string]int{}
+	// Capacity hints from the book size (measured over this library: about
+	// one posting per 18 bytes of text, one distinct term per 250 bytes)
+	// avoid repeated slice growth.
+	textLen := b.Lines.Bytes(b.BodyStart, b.Lines.Len())
+	nTerms := textLen/250 + 64
+	// stop words share the dictionary lookup, marked with stopID
+	const stopID = ^uint32(0)
+	dict := make(map[string]uint32, nTerms+len(stopwords))
+	for w := range stopwords {
+		dict[stem(w)] = stopID
+	}
+	out.terms = make([]string, 0, nTerms)
+	out.chunks = make([]chunk, 0, textLen/1500+8)
+	out.lengths = make([]uint32, 0, textLen/1500+8)
+	var (
+		count   = make([]uint16, 0, nTerms) // per local term, for the current chunk
+		touched = make([]uint32, 0, 512)
+		flat    = make([]struct{ term, chunk uint32 }, 0, textLen/18+64)
+		tfs     = make([]uint8, 0, textLen/18+64)
+		buf     []byte
+		n       uint32
+	)
+	add := func(t string) {
+		id, ok := dict[t]
+		if id == stopID && ok {
+			return
+		}
+		if !ok {
+			id = uint32(len(out.terms))
+			t = strings.Clone(t)
+			dict[t] = id
+			out.terms = append(out.terms, t)
+			count = append(count, 0)
+		}
+		if count[id] == 0 {
+			touched = append(touched, id)
+		}
+		if count[id] < math.MaxUint16 {
+			count[id]++
+		}
+		n++
+	}
 	emit := func(start, end int) {
 		if end <= start {
 			return
 		}
-		clear(tf)
-		n := 0
-		add := func(t string) { tf[t]++; n++ }
+		n, touched = 0, touched[:0]
 		// include section and parent titles so passages match their topic
 		if s := b.SectionAt(start); s != nil {
-			tokenize(s.Title, add)
+			buf = scan(s.Title, buf, false, add)
 			if s.Parent >= 0 {
-				tokenize(b.Sections[s.Parent].Title, add)
+				buf = scan(b.Sections[s.Parent].Title, buf, false, add)
 			}
 		}
-		for _, l := range b.Lines[start:end] {
-			if isTOCLine(l) {
-				continue // printed table-of-contents lines only add noise
+		for i := start; i < end; i++ {
+			if l := b.Lines.At(i); !isTOCLine(l) { // printed contents pages only add noise
+				buf = scan(l, buf, false, add)
 			}
-			tokenize(l, add)
 		}
 		if n == 0 {
 			return
 		}
-		id := uint32(len(out.chunks))
-		out.chunks = append(out.chunks, chunk{book: bi, start: int32(start), end: int32(end), length: uint32(n)})
-		for t, c := range tf {
-			if c > math.MaxUint16 {
-				c = math.MaxUint16
-			}
-			out.postings[t] = append(out.postings[t], posting{chunk: id, tf: uint16(c)})
+		cid := uint32(len(out.chunks))
+		out.chunks = append(out.chunks, chunk{book: bi, start: int32(start), end: int32(end)})
+		out.lengths = append(out.lengths, n)
+		for _, id := range touched {
+			flat = append(flat, struct{ term, chunk uint32 }{id, cid})
+			tfs = append(tfs, uint8(min(count[id], math.MaxUint8)))
+			count[id] = 0
 		}
 	}
 
 	start, size := b.BodyStart, 0
-	for i := b.BodyStart; i < len(b.Lines); i++ {
+	for i := b.BodyStart; i < b.Lines.Len(); i++ {
 		if isStart[i] && i > start {
 			emit(start, i)
 			start, size = i, 0
 		}
-		size += len(b.Lines[i]) + 1
-		if size >= chunkHardBytes || (size >= chunkSoftBytes && strings.TrimSpace(b.Lines[i]) == "") {
+		l := b.Lines.At(i)
+		size += len(l) + 1
+		if size >= chunkHardBytes || (size >= chunkSoftBytes && strings.TrimSpace(l) == "") {
 			emit(start, i+1)
 			start, size = i+1, 0
 		}
 	}
-	emit(start, len(b.Lines))
+	emit(start, b.Lines.Len())
+
+	// Group postings by term (counting sort keeps chunk order within a term).
+	out.termOff = make([]uint32, len(out.terms)+1)
+	for _, f := range flat {
+		out.termOff[f.term+1]++
+	}
+	for t := range out.terms {
+		out.termOff[t+1] += out.termOff[t]
+	}
+	out.post = make([]localPosting, len(flat))
+	next := make([]uint32, len(out.terms))
+	copy(next, out.termOff)
+	for i, f := range flat {
+		out.post[next[f.term]] = localPosting{chunk: f.chunk, tf: tfs[i]}
+		next[f.term]++
+	}
 	return out
 }
 
@@ -148,38 +271,117 @@ type Hit struct {
 	Matched    int // number of distinct query terms present
 }
 
-// scoreAll returns BM25 scores, weighted by query-term coverage, per chunk.
-func (x *Index) scoreAll(terms []string, allow func(*Book) bool) (map[uint32]float64, map[uint32]int) {
-	scores := map[uint32]float64{}
-	matched := map[uint32]int{}
-	N := float64(len(x.chunks))
-	allowed := make([]bool, len(x.books))
-	for i, b := range x.books {
-		allowed[i] = allow == nil || allow(b)
+// scratch holds per-query score buffers; reused through a sync.Pool so a
+// query allocates almost nothing.
+type scratch struct {
+	score   []float32
+	hits    []uint8
+	touched []uint32
+	allowed []bool
+	buf     []byte
+}
+
+var scratchPool sync.Pool
+
+func (x *Index) getScratch() *scratch {
+	s, _ := scratchPool.Get().(*scratch)
+	if s == nil || len(s.score) != len(x.chunks) {
+		s = &scratch{score: make([]float32, len(x.chunks)), hits: make([]uint8, len(x.chunks))}
 	}
+	return s
+}
+
+func putScratch(s *scratch) {
+	for _, id := range s.touched {
+		s.score[id], s.hits[id] = 0, 0
+	}
+	s.touched = s.touched[:0]
+	scratchPool.Put(s)
+}
+
+// score fills s with BM25 scores, weighted by query-term coverage.
+func (x *Index) score(terms []string, allow func(*Book) bool, s *scratch) {
+	s.allowed = s.allowed[:0]
+	for _, b := range x.books {
+		s.allowed = append(s.allowed, allow == nil || allow(b))
+	}
+	N := float64(len(x.chunks))
 	for _, t := range terms {
-		ps := x.postings[t]
-		if len(ps) == 0 {
+		g, ok := x.dict[t]
+		if !ok {
 			continue
 		}
-		df := float64(len(ps))
-		idf := math.Log(1 + (N-df+0.5)/(df+0.5))
-		for _, p := range ps {
-			c := x.chunks[p.chunk]
-			if !allowed[c.book] {
+		df := float64(x.df[g])
+		idf := float32(math.Log(1 + (N-df+0.5)/(df+0.5)))
+		data := x.data[x.off[g]:x.off[g+1]]
+		c := int64(-1)
+		for len(data) > 0 {
+			d, k := binary.Uvarint(data)
+			c += int64(d) + 1
+			f := float32(data[k])
+			data = data[k+1:]
+			id := uint32(c)
+			if !s.allowed[x.chunks[id].book] {
 				continue
 			}
-			f := float64(p.tf)
-			norm := bm25K1 * (1 - bm25B + bm25B*float64(c.length)/x.avgLen)
-			scores[p.chunk] += idf * f * (bm25K1 + 1) / (f + norm)
-			matched[p.chunk]++
+			if s.hits[id] == 0 {
+				s.touched = append(s.touched, id)
+			}
+			s.score[id] += idf * f * (bm25K1 + 1) / (f + x.norm[id])
+			s.hits[id]++
 		}
 	}
-	n := float64(len(terms))
-	for id, s := range scores {
-		scores[id] = s * (0.25 + 0.75*float64(matched[id])/n)
+	n := float32(len(terms))
+	for _, id := range s.touched {
+		s.score[id] *= 0.25 + 0.75*float32(s.hits[id])/n
 	}
-	return scores, matched
+}
+
+// topK returns the ids of the k best-scored touched chunks, best first.
+func topK(s *scratch, k int) []uint32 {
+	if k <= 0 || len(s.touched) <= k {
+		ids := append([]uint32(nil), s.touched...)
+		sort.Slice(ids, func(i, j int) bool { return s.score[ids[i]] > s.score[ids[j]] })
+		return ids
+	}
+	// min-heap of size k on score
+	h := make([]uint32, 0, k)
+	less := func(a, b uint32) bool { return s.score[a] < s.score[b] }
+	down := func(i int) {
+		for {
+			l := 2*i + 1
+			if l >= len(h) {
+				return
+			}
+			m := l
+			if r := l + 1; r < len(h) && less(h[r], h[l]) {
+				m = r
+			}
+			if !less(h[m], h[i]) {
+				return
+			}
+			h[i], h[m] = h[m], h[i]
+			i = m
+		}
+	}
+	for _, id := range s.touched {
+		if len(h) < k {
+			h = append(h, id)
+			for i := len(h) - 1; i > 0; {
+				p := (i - 1) / 2
+				if !less(h[i], h[p]) {
+					break
+				}
+				h[i], h[p] = h[p], h[i]
+				i = p
+			}
+		} else if less(h[0], id) {
+			h[0] = id
+			down(0)
+		}
+	}
+	sort.Slice(h, func(i, j int) bool { return s.score[h[i]] > s.score[h[j]] })
+	return h
 }
 
 // Search returns the best chunks for query, best first.
@@ -188,35 +390,34 @@ func (x *Index) Search(query string, allow func(*Book) bool, limit int) []Hit {
 	if len(terms) == 0 {
 		return nil
 	}
-	scores, matched := x.scoreAll(terms, allow)
-	ids := make([]uint32, 0, len(scores))
-	for id := range scores {
-		ids = append(ids, id)
-	}
-	sort.Slice(ids, func(i, j int) bool { return scores[ids[i]] > scores[ids[j]] })
+	s := x.getScratch()
+	defer putScratch(s)
+	x.score(terms, allow, s)
 
-	// Exact phrase bonus on the leading candidates.
-	phrase := strings.ToLower(strings.Join(strings.Fields(query), " "))
-	if len(terms) > 1 && len(phrase) > 3 {
-		top := ids[:min(len(ids), 400)]
-		for _, id := range top {
+	phrase := strings.Join(strings.Fields(query), " ")
+	find, usePhrase := LiteralFinder(phrase, true)
+	usePhrase = usePhrase && len(terms) > 1 && len(phrase) > 3
+	k := limit
+	if usePhrase {
+		k = max(limit, 200)
+	}
+	ids := topK(s, k)
+	if usePhrase {
+		for _, id := range ids {
 			c := x.chunks[id]
-			b := x.books[c.book]
-			text := strings.ToLower(strings.Join(b.Lines[c.start:c.end], " "))
-			if strings.Contains(text, phrase) {
-				scores[id] *= 1.6
+			if find(x.books[c.book].Lines.Span(int(c.start), int(c.end))) != nil {
+				s.score[id] *= 1.6
 			}
 		}
-		sort.SliceStable(top, func(i, j int) bool { return scores[top[i]] > scores[top[j]] })
+		sort.SliceStable(ids, func(i, j int) bool { return s.score[ids[i]] > s.score[ids[j]] })
 	}
-
 	if limit > 0 && len(ids) > limit {
 		ids = ids[:limit]
 	}
 	hits := make([]Hit, len(ids))
 	for i, id := range ids {
 		c := x.chunks[id]
-		hits[i] = Hit{Book: x.books[c.book], Start: int(c.start), End: int(c.end), Score: scores[id], Matched: matched[id]}
+		hits[i] = Hit{Book: x.books[c.book], Start: int(c.start), End: int(c.end), Score: float64(s.score[id]), Matched: int(s.hits[id])}
 	}
 	return hits
 }
@@ -231,88 +432,161 @@ type BookScore struct {
 	Matched  []string // query words found in this book's best passages
 }
 
+const bookTop = 8
+
+var bookWeights = [bookTop]float32{1, 0.5, 0.35, 0.25, 0.2, 0.15, 0.1, 0.1}
+
 // RankBooks scores books by their best passages plus a title/category bonus.
 func (x *Index) RankBooks(query string, allow func(*Book) bool, limit, hitsPerBook int) []BookScore {
 	terms := Terms(query)
 	if len(terms) == 0 {
 		return nil
 	}
-	scores, matched := x.scoreAll(terms, allow)
-	per := map[int32][]uint32{}
-	best := 0.0
-	for id, s := range scores {
-		c := x.chunks[id]
-		per[c.book] = append(per[c.book], id)
-		best = max(best, s)
-	}
-	var out []BookScore
-	for bi, ids := range per {
-		sort.Slice(ids, func(i, j int) bool { return scores[ids[i]] > scores[ids[j]] })
-		b := x.books[bi]
-		weights := []float64{1, 0.5, 0.35, 0.25, 0.2, 0.15, 0.1, 0.1}
-		var s float64
-		for i, id := range ids {
-			if i >= len(weights) {
-				break
+	s := x.getScratch()
+	defer putScratch(s)
+	x.score(terms, allow, s)
+
+	// best bookTop chunks per book, kept sorted by insertion
+	top := make([][bookTop]uint32, len(x.books))
+	cnt := make([]int, len(x.books))
+	var best float32
+	for _, id := range s.touched {
+		bi := x.chunks[id].book
+		sc := s.score[id]
+		best = max(best, sc)
+		n := min(cnt[bi], bookTop)
+		cnt[bi]++
+		j := n
+		for j > 0 && s.score[top[bi][j-1]] < sc {
+			if j < bookTop {
+				top[bi][j] = top[bi][j-1]
 			}
-			s += weights[i] * scores[id]
+			j--
 		}
-		bs := BookScore{Book: b, Chunks: len(ids)}
-		hay := map[string]bool{}
-		tokenize(b.Title+" "+b.Category, func(t string) { hay[t] = true })
+		if j < bookTop {
+			top[bi][j] = id
+		}
+	}
+
+	var out []BookScore
+	for bi, n := range cnt {
+		if n == 0 {
+			continue
+		}
+		var sc float32
+		for i := 0; i < min(n, bookTop); i++ {
+			sc += bookWeights[i] * s.score[top[bi][i]]
+		}
+		bs := BookScore{Book: x.books[bi], Chunks: n}
 		hit := 0
 		for _, t := range terms {
-			if hay[t] {
-				hit++
+			for _, tt := range x.titles[bi] {
+				if t == tt {
+					hit++
+					break
+				}
 			}
 		}
 		if hit > 0 {
-			s += best * 0.8 * float64(hit) / float64(len(terms))
+			sc += best * 0.8 * float32(hit) / float32(len(terms))
 			bs.TitleHit = true
 		}
-		bs.Score = s
-		bs.Matched = matchedWords(query, x.books[bi], ids[:min(len(ids), 8)], x)
-		for i, id := range ids {
-			if i >= hitsPerBook {
-				break
-			}
-			c := x.chunks[id]
-			bs.TopHits = append(bs.TopHits, Hit{Book: b, Start: int(c.start), End: int(c.end), Score: scores[id], Matched: matched[id]})
-		}
+		bs.Score = float64(sc)
 		out = append(out, bs)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Score > out[j].Score })
 	if limit > 0 && len(out) > limit {
 		out = out[:limit]
 	}
+	// details only for the books we return
+	for i := range out {
+		b := out[i].Book
+		bi := bookIndexOf(x.books, b)
+		ids := top[bi][:min(cnt[bi], bookTop)]
+		out[i].Matched = matchedWords(query, terms, b, ids, x, s)
+		for j, id := range ids {
+			if j >= hitsPerBook {
+				break
+			}
+			c := x.chunks[id]
+			out[i].TopHits = append(out[i].TopHits, Hit{Book: b, Start: int(c.start), End: int(c.end), Score: float64(s.score[id]), Matched: int(s.hits[id])})
+		}
+	}
+	return out
+}
+
+func bookIndexOf(books []*Book, b *Book) int {
+	for i, x := range books {
+		if x == b {
+			return i
+		}
+	}
+	return -1
+}
+
+// matchedWords returns the query words found in the given chunks.
+func matchedWords(query string, terms []string, b *Book, ids []uint32, x *Index, s *scratch) []string {
+	found := make([]bool, len(terms))
+	mark := func(t string) {
+		for i, q := range terms {
+			if q == t {
+				found[i] = true
+			}
+		}
+	}
+	for _, id := range ids {
+		c := x.chunks[id]
+		if sec := b.SectionAt(int(c.start)); sec != nil {
+			s.buf = scanTerms(sec.Title, s.buf, mark)
+		}
+		s.buf = scanTerms(b.Lines.Span(int(c.start), int(c.end)), s.buf, mark)
+	}
+	present := map[string]bool{}
+	for i, t := range terms {
+		if found[i] {
+			present[t] = true
+		}
+	}
+	var out []string
+	seen := map[string]bool{}
+	for _, w := range strings.Fields(query) {
+		w = strings.Trim(w, ".,;:!?()[]\"'")
+		ok := false
+		tokenize(w, func(t string) { ok = ok || present[t] })
+		if lw := strings.ToLower(w); ok && !seen[lw] {
+			seen[lw] = true
+			out = append(out, w)
+		}
+	}
 	return out
 }
 
 // Snippet returns the most query-relevant line(s) of a hit, cleaned.
 func Snippet(b *Book, start, end int, query string, maxLen int) (string, int) {
-	terms := map[string]bool{}
-	for _, t := range Terms(query) {
-		terms[t] = true
-	}
+	terms := Terms(query)
+	end = min(end, b.Lines.Len())
 	bestLine, bestScore := start, -1
-	for i := start; i < end && i < len(b.Lines); i++ {
-		l := b.Lines[i]
+	var buf []byte
+	for i := start; i < end; i++ {
+		l := b.Lines.At(i)
 		if strings.HasPrefix(strings.TrimSpace(l), "#") {
 			continue
 		}
-		seen := map[string]bool{}
-		tokenize(l, func(t string) {
-			if terms[t] {
-				seen[t] = true
+		var seen uint64
+		buf = scanTerms(l, buf, func(t string) {
+			for k, q := range terms {
+				if q == t && k < 64 {
+					seen |= 1 << k
+				}
 			}
 		})
-		if len(seen) > bestScore {
-			bestLine, bestScore = i, len(seen)
+		if n := popcount(seen); n > bestScore {
+			bestLine, bestScore = i, n
 		}
 	}
 	var sb strings.Builder
-	for i := bestLine; i < end && i < len(b.Lines) && sb.Len() < maxLen; i++ {
-		l := cleanInline(b.Lines[i])
+	for i := bestLine; i < end && sb.Len() < maxLen; i++ {
+		l := cleanInline(b.Lines.At(i))
 		if l == "" {
 			continue
 		}
@@ -322,6 +596,14 @@ func Snippet(b *Book, start, end int, query string, maxLen int) (string, int) {
 		sb.WriteString(l)
 	}
 	return truncate(sb.String(), maxLen), bestLine
+}
+
+func popcount(v uint64) int {
+	n := 0
+	for ; v != 0; v &= v - 1 {
+		n++
+	}
+	return n
 }
 
 // Search is the library-level full-text search.
@@ -336,32 +618,5 @@ func (l *Library) RankBooks(query string, allow func(*Book) bool, limit, hitsPer
 
 // Stats reports index size.
 func (l *Library) Stats() (chunks, terms int) {
-	return len(l.index.chunks), len(l.index.postings)
-}
-
-// matchedWords returns the query words found in the given chunks.
-func matchedWords(query string, b *Book, ids []uint32, x *Index) []string {
-	present := map[string]bool{}
-	for _, id := range ids {
-		c := x.chunks[id]
-		if s := b.SectionAt(int(c.start)); s != nil {
-			tokenize(s.Title, func(t string) { present[t] = true })
-		}
-		for _, l := range b.Lines[c.start:c.end] {
-			tokenize(l, func(t string) { present[t] = true })
-		}
-	}
-	var out []string
-	seen := map[string]bool{}
-	for _, w := range strings.Fields(query) {
-		w = strings.Trim(w, ".,;:!?()[]\"'")
-		ok := false
-		tokenize(w, func(t string) { ok = ok || present[t] })
-		lw := strings.ToLower(w)
-		if ok && !seen[lw] {
-			seen[lw] = true
-			out = append(out, w)
-		}
-	}
-	return out
+	return len(l.index.chunks), len(l.index.df)
 }

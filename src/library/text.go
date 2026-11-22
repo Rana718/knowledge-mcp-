@@ -6,6 +6,7 @@ import (
 	"strings"
 	"unicode"
 	"unicode/utf8"
+	"unsafe"
 )
 
 // stopwords are dropped from both the index and queries.
@@ -42,22 +43,36 @@ func stem(w string) string {
 	return w
 }
 
-// tokenize calls fn for each normalized term of s.
+// tokenize calls fn for each normalized term of s (safe to keep).
 func tokenize(s string, fn func(term string)) {
-	var buf []byte
+	scanTerms(s, nil, func(t string) { fn(strings.Clone(t)) })
+}
+
+// scanTerms calls fn for each normalized term of s without allocating. The
+// string given to fn aliases buf and is only valid during the call: clone it
+// before storing, and never use it as a map key in an assignment.
+// It returns buf for reuse.
+func scanTerms(s string, buf []byte, fn func(term string)) []byte {
+	return scan(s, buf, true, fn)
+}
+
+// scan is scanTerms with the stop-word check optional (the indexer folds it
+// into its own dictionary lookup to save a map access per word).
+func scan(s string, buf []byte, checkStop bool, fn func(term string)) []byte {
+	buf = buf[:0]
 	flush := func() {
 		if len(buf) == 0 {
 			return
 		}
-		t := strings.Trim(string(buf), "_")
+		t := strings.Trim(unsafe.String(unsafe.SliceData(buf), len(buf)), "_")
+		if len(t) >= 2 && len(t) <= 40 {
+			if !checkStop {
+				fn(stem(t))
+			} else if _, stop := stopwords[t]; !stop {
+				fn(stem(t))
+			}
+		}
 		buf = buf[:0]
-		if len(t) < 2 || len(t) > 40 {
-			return
-		}
-		if _, ok := stopwords[t]; ok {
-			return
-		}
-		fn(stem(t))
 	}
 	for i := 0; i < len(s); {
 		c := s[i]
@@ -86,6 +101,7 @@ func tokenize(s string, fn func(term string)) {
 		i += size
 	}
 	flush()
+	return buf
 }
 
 // Terms returns the normalized, de-duplicated query terms of s.
@@ -104,7 +120,6 @@ func Terms(s string) []string {
 var (
 	reHTMLTag     = regexp.MustCompile(`</?(u|b|i|em|strong|sup|sub|br|mark|span|code|small|kbd|s)\s*/?>`)
 	reSpaces      = regexp.MustCompile(`\s+`)
-	reHeading     = regexp.MustCompile(`^(#{1,6})\s+(.+?)\s*#*\s*$`)
 	reOnlyNums    = regexp.MustCompile(`^[\divxlcdmIVXLCDM.\-–\s]+$`)
 	reCaption     = regexp.MustCompile(`(?i)^(example|listing|figure|fig\.|table|exhibit|code|output|snippet)\s*\d`)
 	reChapter     = regexp.MustCompile(`(?i)^(chapter|appendix|lecture|unit|module|lesson)\s+([0-9]+|[ivxlc]+|[a-z]\b|one|two|three|four|five|six|seven|eight|nine|ten)\b`)
@@ -131,12 +146,18 @@ systemctl service crontab tail head less more sort uniq wc awk sed xargs tee tim
 	return m
 }()
 
+var inlineMarks = strings.NewReplacer("**", "", "__", "", "`", "", "<!--", "", "-->", "")
+
 // cleanInline strips markdown emphasis and inline HTML.
 func cleanInline(s string) string {
-	s = reHTMLTag.ReplaceAllString(s, " ")
-	s = strings.NewReplacer("**", "", "__", "", "`", "", "<!--", "", "-->", "").Replace(s)
+	if strings.IndexByte(s, '<') >= 0 {
+		s = reHTMLTag.ReplaceAllString(s, " ")
+	}
+	s = inlineMarks.Replace(s)
 	s = strings.Trim(s, " *_\t")
-	s = reSpaces.ReplaceAllString(s, " ")
+	if strings.Contains(s, "  ") || strings.ContainsAny(s, "\t\n\r") {
+		s = reSpaces.ReplaceAllString(s, " ")
+	}
 	return strings.TrimSpace(s)
 }
 
@@ -223,34 +244,37 @@ func isSpacedLetters(title string) bool {
 
 // vocab holds a book's word frequencies for re-segmenting spaced titles.
 type vocab struct {
-	freq  map[string]int
+	freq  map[string]*int32
 	total float64
 }
 
-func buildVocab(lines []string) *vocab {
-	v := &vocab{freq: map[string]int{}}
+func buildVocab(text string) *vocab {
+	v := &vocab{freq: map[string]*int32{}}
 	var buf []byte
 	flush := func() {
 		if len(buf) > 0 && len(buf) <= 20 {
-			v.freq[string(buf)]++
+			if n := v.freq[string(buf)]; n != nil { // lookup does not allocate
+				*n++
+			} else {
+				one := int32(1)
+				v.freq[string(buf)] = &one
+			}
 			v.total++
 		}
 		buf = buf[:0]
 	}
-	for _, l := range lines {
-		for i := 0; i < len(l); i++ {
-			c := l[i]
-			switch {
-			case c >= 'a' && c <= 'z':
-				buf = append(buf, c)
-			case c >= 'A' && c <= 'Z':
-				buf = append(buf, c+32)
-			default:
-				flush()
-			}
+	for i := 0; i < len(text); i++ {
+		c := text[i]
+		switch {
+		case c >= 'a' && c <= 'z':
+			buf = append(buf, c)
+		case c >= 'A' && c <= 'Z':
+			buf = append(buf, c+32)
+		default:
+			flush()
 		}
-		flush()
 	}
+	flush()
 	return v
 }
 
@@ -264,9 +288,9 @@ func (v *vocab) segment(run string) []string {
 		for j := max(0, i-20); j < i; j++ {
 			w := run[j:i]
 			var cost float64
-			if f := v.freq[w]; f > 0 && (len(w) > 1 || w == "a" || w == "i") {
+			if f := v.freq[w]; f != nil && (len(w) > 1 || w == "a" || w == "i") {
 				// penalize long tokens such as run-together page headers
-				cost = -math.Log(float64(f)/v.total) + 0.6*float64(max(0, len(w)-8))
+				cost = -math.Log(float64(*f)/v.total) + 0.6*float64(max(0, len(w)-8))
 			} else {
 				cost = 25 + 5*float64(len(w))
 			}
@@ -324,4 +348,16 @@ func (v *vocab) despace(title string) string {
 // CleanLine strips heading markers and inline markdown from a line.
 func CleanLine(l string) string {
 	return cleanInline(strings.TrimLeft(strings.TrimSpace(l), "#> "))
+}
+
+// parseHeading splits "### Title ##" into level 3 and "Title".
+func parseHeading(l string) (level int, text string, ok bool) {
+	for level < len(l) && level < 7 && l[level] == '#' {
+		level++
+	}
+	if level == 0 || level > 6 || level >= len(l) || (l[level] != ' ' && l[level] != '\t') {
+		return 0, "", false
+	}
+	text = strings.TrimSpace(strings.TrimRight(strings.TrimSpace(l[level:]), "#"))
+	return level, text, text != ""
 }

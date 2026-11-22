@@ -2,6 +2,7 @@
 package library
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io/fs"
@@ -12,6 +13,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unsafe"
 )
 
 // Book statuses.
@@ -43,7 +45,7 @@ type Book struct {
 	SourcePDF string
 	Status    string
 	Chars     int // non-whitespace characters of body text
-	Lines     []string
+	Lines     Lines
 	BodyStart int // first line after the generated metadata header
 	Sections  []Section
 }
@@ -101,11 +103,12 @@ func Load(root string) (*Library, error) {
 		return nil, fmt.Errorf("no .md books found under %s", root)
 	}
 	sort.Strings(paths)
+	workers := max(2, runtime.NumCPU()/2)
 
 	books := make([]*Book, len(paths))
 	errs := make([]error, len(paths))
 	var wg sync.WaitGroup
-	sem := make(chan struct{}, runtime.NumCPU())
+	sem := make(chan struct{}, workers)
 	for i, p := range paths {
 		wg.Add(1)
 		go func() {
@@ -131,7 +134,7 @@ func Load(root string) (*Library, error) {
 		}
 		lib.byID[strings.ToLower(b.ID)] = b
 	}
-	lib.index = buildIndex(books)
+	lib.index = buildIndex(books, workers)
 	lib.titles = buildTitleIndex(books)
 	lib.LoadTime = time.Since(t0)
 	return lib, nil
@@ -142,7 +145,12 @@ func loadBook(path, rel string, meta indexEntry) (*Book, error) {
 	if err != nil {
 		return nil, err
 	}
-	text := strings.ReplaceAll(string(data), "\r\n", "\n")
+	var text string
+	if bytes.IndexByte(data, '\r') >= 0 {
+		text = strings.ReplaceAll(string(data), "\r\n", "\n")
+	} else if len(data) > 0 {
+		text = unsafe.String(unsafe.SliceData(data), len(data)) // data is never modified: no second copy
+	}
 	b := &Book{
 		ID:        strings.TrimSuffix(filepath.Base(rel), filepath.Ext(rel)),
 		RelPath:   rel,
@@ -150,17 +158,17 @@ func loadBook(path, rel string, meta indexEntry) (*Book, error) {
 		Title:     meta.Title,
 		Pages:     meta.Pages,
 		SourcePDF: meta.PDFPath,
-		Lines:     strings.Split(text, "\n"),
+		Lines:     newLines(text),
 	}
 	if meta.Category != "" {
 		b.Category = meta.Category
 	}
 	// Skip the generated header ("# Title", "> **Source Document**", "---").
-	for i := 0; i < len(b.Lines) && i < 15; i++ {
-		l := strings.TrimSpace(b.Lines[i])
+	for i := 0; i < b.Lines.Len() && i < 15; i++ {
+		l := strings.TrimSpace(b.Lines.At(i))
 		if i == 0 && b.Title == "" {
-			if m := reHeading.FindStringSubmatch(l); m != nil {
-				b.Title = cleanInline(m[2])
+			if _, raw, ok := parseHeading(l); ok {
+				b.Title = cleanInline(raw)
 			}
 		}
 		if l == "---" {
@@ -171,13 +179,8 @@ func loadBook(path, rel string, meta indexEntry) (*Book, error) {
 	if b.Title == "" {
 		b.Title = strings.ReplaceAll(b.ID, "_", " ")
 	}
-	for _, l := range b.Lines[b.BodyStart:] {
-		for _, r := range l {
-			if r != ' ' && r != '\t' {
-				b.Chars++
-			}
-		}
-	}
+	body := b.Lines.Span(b.BodyStart, b.Lines.Len())
+	b.Chars = len(body) - strings.Count(body, " ") - strings.Count(body, "\n") - strings.Count(body, "\t")
 	switch {
 	case b.Chars < 1500:
 		b.Status = StatusNoText
@@ -191,11 +194,11 @@ func loadBook(path, rel string, meta indexEntry) (*Book, error) {
 }
 
 // parseSections finds the real headings and computes each section's span and rank.
-func parseSections(lines []string, start int) []Section {
+func parseSections(lines Lines, start int) []Section {
 	var secs []Section
 	inFence := false
-	for i := start; i < len(lines); i++ {
-		l := strings.TrimSpace(lines[i])
+	for i := start; i < lines.Len(); i++ {
+		l := strings.TrimSpace(lines.At(i))
 		if strings.HasPrefix(l, "```") || strings.HasPrefix(l, "~~~") {
 			inFence = !inFence
 			continue
@@ -203,15 +206,15 @@ func parseSections(lines []string, start int) []Section {
 		if inFence || len(l) < 3 || l[0] != '#' {
 			continue
 		}
-		m := reHeading.FindStringSubmatch(l)
-		if m == nil {
+		level, raw, ok := parseHeading(l)
+		if !ok {
 			continue
 		}
-		title := cleanInline(m[2])
-		if isNoiseHeading(title, m[2], len(m[1])) {
+		title := cleanInline(raw)
+		if isNoiseHeading(title, raw, level) {
 			continue
 		}
-		secs = append(secs, Section{ID: len(secs), Title: title, Level: len(m[1]), Start: i, Parent: -1})
+		secs = append(secs, Section{ID: len(secs), Title: title, Level: level, Start: i, Parent: -1})
 	}
 
 	// Repair letter-spaced titles using the book's own vocabulary.
@@ -219,7 +222,7 @@ func parseSections(lines []string, start int) []Section {
 	for i := range secs {
 		if isSpacedLetters(secs[i].Title) {
 			if voc == nil {
-				voc = buildVocab(lines[start:])
+				voc = buildVocab(lines.Span(start, lines.Len()))
 			}
 			secs[i].Title = voc.despace(secs[i].Title)
 		}
@@ -312,14 +315,10 @@ func parseSections(lines []string, start int) []Section {
 		stack = append(stack, i)
 	}
 	for _, i := range stack {
-		secs[i].End = len(lines)
+		secs[i].End = lines.Len()
 	}
 	for i := range secs {
-		n := 0
-		for _, l := range lines[secs[i].Start:secs[i].End] {
-			n += len(l) + 1
-		}
-		secs[i].Chars = n
+		secs[i].Chars = lines.Bytes(secs[i].Start, secs[i].End)
 	}
 	return secs
 }
